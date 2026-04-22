@@ -9,3 +9,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [[example]]
 name = "basic"
+
+[[example]]
+name = "hooks"
