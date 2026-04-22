@@ -2,58 +2,65 @@ use anyhow::Result;
 
 use crate::context::Context;
 use crate::hook::{Hook, HookPoint, StepInfo};
+use crate::metrics::{MetricsSink, MetricsStore};
+use crate::parallel::Parallel;
 use crate::step::Step;
 
-/// A sequence of [`Step`]s executed in order against a shared [`Context`].
-///
-/// Optional [`Hook`]s may be attached to observe step lifecycle events.
+/// A top-level unit of scenario execution.
+pub(crate) enum Node {
+    Step(Step),
+    Parallel(Parallel),
+}
+
+/// A sequence of top-level nodes (steps or parallel blocks) executed in
+/// order against a shared [`Context`].
 pub struct Scenario {
-    steps: Vec<Step>,
+    nodes: Vec<Node>,
     hooks: Vec<Hook>,
 }
 
 impl Scenario {
     pub fn new() -> Self {
         Self {
-            steps: Vec::new(),
+            nodes: Vec::new(),
             hooks: Vec::new(),
         }
     }
 
-    /// Append a step to the scenario (builder pattern).
+    /// Append a top-level step (mutable or read-only one-shot).
     pub fn step(mut self, step: Step) -> Self {
-        self.steps.push(step);
+        self.nodes.push(Node::Step(step));
         self
     }
 
-    /// Attach a hook to the scenario. Hooks run in insertion order.
+    /// Append a parallel block.
+    pub fn parallel(mut self, parallel: Parallel) -> Self {
+        self.nodes.push(Node::Parallel(parallel));
+        self
+    }
+
+    /// Attach a lifecycle hook. Hooks run in insertion order.
     pub fn hook(mut self, hook: Hook) -> Self {
         self.hooks.push(hook);
         self
     }
 
-    /// Execute all steps sequentially. Stops at the first failure,
-    /// including hook failures.
+    /// Execute the scenario. The first error stops execution.
     pub async fn run(self) -> Result<()> {
-        let mut ctx = Context::new();
-        for step in &self.steps {
-            let info = StepInfo { name: step.name() };
+        let (result, _store) = self.run_inner().await;
+        result
+    }
 
-            for hook in &self.hooks {
-                if hook.point() == HookPoint::BeforeStep {
-                    (hook.func)(&mut ctx, &info).await?;
-                }
-            }
-
-            step.execute(&mut ctx).await?;
-
-            for hook in &self.hooks {
-                if hook.point() == HookPoint::AfterStep {
-                    (hook.func)(&mut ctx, &info).await?;
-                }
-            }
-        }
-        Ok(())
+    /// Test-only hook that returns the collected metrics alongside the
+    /// scenario result. Kept crate-private; a public reporting API is
+    /// out of scope for this iteration.
+    pub(crate) async fn run_inner(self) -> (Result<()>, MetricsStore) {
+        let (sink, mut rx) = MetricsSink::new();
+        let mut ctx = Context::with_metrics(sink);
+        let result = execute_nodes(&self.nodes, &self.hooks, &mut ctx).await;
+        drop(ctx);
+        let store = MetricsStore::drain_from(&mut rx);
+        (result, store)
     }
 }
 
@@ -63,8 +70,62 @@ impl Default for Scenario {
     }
 }
 
+async fn execute_nodes(nodes: &[Node], hooks: &[Hook], ctx: &mut Context) -> Result<()> {
+    for node in nodes {
+        match node {
+            Node::Step(step) => {
+                let info = StepInfo { name: step.name() };
+                run_hooks(hooks, HookPoint::BeforeStep, ctx, &info).await?;
+                step.execute_top(ctx).await?;
+                run_hooks(hooks, HookPoint::AfterStep, ctx, &info).await?;
+            }
+            Node::Parallel(par) => {
+                // Hooks are step-level. Before-hooks for each child run
+                // sequentially (with `&mut Context`) before any body starts.
+                for step in par.steps() {
+                    let info = StepInfo { name: step.name() };
+                    run_hooks(hooks, HookPoint::BeforeStep, ctx, &info).await?;
+                }
+
+                let block_result = par.execute_bodies(&*ctx).await;
+
+                // After-hooks run only if the whole block succeeded,
+                // preserving the rule that after_step runs only after a
+                // successful step.
+                if block_result.is_ok() {
+                    for step in par.steps() {
+                        let info = StepInfo { name: step.name() };
+                        run_hooks(hooks, HookPoint::AfterStep, ctx, &info).await?;
+                    }
+                }
+
+                block_result?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_hooks(
+    hooks: &[Hook],
+    point: HookPoint,
+    ctx: &mut Context,
+    info: &StepInfo<'_>,
+) -> Result<()> {
+    for hook in hooks {
+        if hook.point() == point {
+            (hook.func)(ctx, info).await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::hook::Hook;
     use crate::slot::Slot;
@@ -79,9 +140,11 @@ mod tests {
         ctx.get_mut(EVENTS).unwrap().push(label.to_string());
     }
 
+    // ----- Preserved coverage: sequential mutable scenarios -----
+
     #[tokio::test]
     async fn scenario_runs_steps_in_order() {
-        let result = Scenario::new()
+        Scenario::new()
             .step(Step::named("init").run(|ctx| {
                 Box::pin(async move {
                     ctx.insert(COUNTER, 0);
@@ -97,15 +160,13 @@ mod tests {
             }))
             .step(Step::named("check").run(|ctx| {
                 Box::pin(async move {
-                    let val = *ctx.get(COUNTER)?;
-                    assert_eq!(val, 1);
+                    assert_eq!(*ctx.get(COUNTER)?, 1);
                     Ok(())
                 })
             }))
             .run()
-            .await;
-
-        result.unwrap();
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -122,7 +183,6 @@ mod tests {
             }))
             .run()
             .await;
-
         assert!(result.is_err());
     }
 
@@ -131,11 +191,11 @@ mod tests {
         Scenario::new().run().await.unwrap();
     }
 
+    // ----- Existing hook coverage preserved -----
+
     #[tokio::test]
     async fn before_step_runs_before_each_step() {
-        // Hook records the step name before each step; the step records itself.
-        // The expected order is: before:A, step:A, before:B, step:B.
-        let result = Scenario::new()
+        Scenario::new()
             .hook(Hook::before_step("record-before", |ctx, info| {
                 let label = format!("before:{}", info.name);
                 Box::pin(async move {
@@ -158,7 +218,6 @@ mod tests {
             .step(Step::named("collect").run(|ctx| {
                 Box::pin(async move {
                     let events = ctx.get(EVENTS)?.clone();
-                    // The collect step's own before-hook has also run.
                     assert_eq!(
                         events,
                         vec!["before:A", "step:A", "before:B", "step:B", "before:collect"]
@@ -167,14 +226,13 @@ mod tests {
                 })
             }))
             .run()
-            .await;
-
-        result.unwrap();
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn after_step_runs_after_each_step() {
-        let result = Scenario::new()
+        Scenario::new()
             .hook(Hook::after_step("record-after", |ctx, info| {
                 let label = format!("after:{}", info.name);
                 Box::pin(async move {
@@ -197,23 +255,18 @@ mod tests {
             .step(Step::named("collect").run(|ctx| {
                 Box::pin(async move {
                     let events = ctx.get(EVENTS)?.clone();
-                    // Note: 'collect' step itself runs, but we snapshot before its own after-hook.
-                    assert_eq!(
-                        events,
-                        vec!["step:A", "after:A", "step:B", "after:B"]
-                    );
+                    assert_eq!(events, vec!["step:A", "after:A", "step:B", "after:B"]);
                     Ok(())
                 })
             }))
             .run()
-            .await;
-
-        result.unwrap();
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn hooks_run_in_insertion_order() {
-        let result = Scenario::new()
+        Scenario::new()
             .hook(Hook::before_step("b1", |ctx, _info| {
                 Box::pin(async move {
                     record_step(ctx, "b1");
@@ -247,8 +300,6 @@ mod tests {
             .step(Step::named("assert").run(|ctx| {
                 Box::pin(async move {
                     let events = ctx.get(EVENTS)?.clone();
-                    // First step: b1, b2, step, a1, a2. Second step only runs
-                    // its before-hooks before the assertion reads EVENTS.
                     assert_eq!(
                         events,
                         vec!["b1", "b2", "step", "a1", "a2", "b1", "b2"]
@@ -257,9 +308,8 @@ mod tests {
                 })
             }))
             .run()
-            .await;
-
-        result.unwrap();
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -276,8 +326,6 @@ mod tests {
             }))
             .run()
             .await;
-
-        assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("before failure"));
     }
 
@@ -296,77 +344,26 @@ mod tests {
             }))
             .run()
             .await;
-
-        assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("after failure"));
     }
 
     #[tokio::test]
-    async fn after_step_skipped_when_step_fails() {
-        // Use a shared counter on the context: before increments it,
-        // after would too. If the step fails, after must NOT run.
-        const HITS: Slot<i32> = Slot::new("hits");
-
-        let result = Scenario::new()
-            .hook(Hook::before_step("before", |ctx, _info| {
-                Box::pin(async move {
-                    let v = *ctx.get(HITS).unwrap_or(&0);
-                    ctx.insert(HITS, v + 1);
-                    Ok(())
-                })
-            }))
-            .hook(Hook::after_step("after", |ctx, _info| {
-                Box::pin(async move {
-                    let v = *ctx.get(HITS).unwrap_or(&0);
-                    ctx.insert(HITS, v + 100);
-                    Ok(())
-                })
-            }))
-            .step(Step::named("seed").run(|ctx| {
-                Box::pin(async move {
-                    ctx.insert(HITS, 0);
-                    Ok(())
-                })
-            }))
-            .step(Step::named("fail").run(|_ctx| {
-                Box::pin(async move { anyhow::bail!("step failed") })
-            }))
-            .run()
-            .await;
-
-        assert!(result.is_err());
-        // We can't inspect ctx after run() consumes the scenario, so we
-        // instead verify via a sibling test below using a shared state slot.
-        drop(result);
-    }
-
-    #[tokio::test]
-    async fn after_step_not_called_on_step_failure_observable() {
-        // Observable version: use a step before the failing one that snapshots
-        // the hit counter on failure isn't possible (run consumes scenario),
-        // so we rely on a "witness" step: the after-hook would push an event,
-        // but the scenario aborts. A follow-up step that reads the events
-        // slot would never run, so we instead count via a static... For a
-        // purely in-scenario observable test, use an Arc<AtomicUsize>.
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
+    async fn after_step_not_called_on_step_failure() {
         let before_hits = Arc::new(AtomicUsize::new(0));
         let after_hits = Arc::new(AtomicUsize::new(0));
-
-        let before_hits_clone = before_hits.clone();
-        let after_hits_clone = after_hits.clone();
+        let b = before_hits.clone();
+        let a = after_hits.clone();
 
         let result = Scenario::new()
             .hook(Hook::before_step("count-before", move |_ctx, _info| {
-                let c = before_hits_clone.clone();
+                let c = b.clone();
                 Box::pin(async move {
                     c.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 })
             }))
             .hook(Hook::after_step("count-after", move |_ctx, _info| {
-                let c = after_hits_clone.clone();
+                let c = a.clone();
                 Box::pin(async move {
                     c.fetch_add(1, Ordering::SeqCst);
                     Ok(())
@@ -380,8 +377,216 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        // before ran twice (ok, fail), after only ran once (for ok).
         assert_eq!(before_hits.load(Ordering::SeqCst), 2);
         assert_eq!(after_hits.load(Ordering::SeqCst), 1);
+    }
+
+    // ----- New: parallel + concurrent + metrics -----
+
+    #[tokio::test]
+    async fn parallel_runs_children_concurrently_and_waits_for_all() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h_a = hits.clone();
+        let h_b = hits.clone();
+        let h_c = hits.clone();
+
+        let start = Instant::now();
+        Scenario::new()
+            .parallel(
+                Parallel::named("load")
+                    .step(Step::named("a").run_readonly(move |_ctx| {
+                        let h = h_a.clone();
+                        Box::pin(async move {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            h.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                    }))
+                    .step(Step::named("b").run_readonly(move |_ctx| {
+                        let h = h_b.clone();
+                        Box::pin(async move {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            h.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                    }))
+                    .step(Step::named("c").run_readonly(move |_ctx| {
+                        let h = h_c.clone();
+                        Box::pin(async move {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            h.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                    })),
+            )
+            .run()
+            .await
+            .unwrap();
+
+        let elapsed = start.elapsed();
+        // wait-all: all children ran
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        // concurrent: ~80ms rather than ~240ms
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "parallel elapsed too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_fails_if_any_child_fails() {
+        let result = Scenario::new()
+            .parallel(
+                Parallel::named("p")
+                    .step(Step::named("ok").run_readonly(|_ctx| {
+                        Box::pin(async move { Ok(()) })
+                    }))
+                    .step(Step::named("boom").run_readonly(|_ctx| {
+                        Box::pin(async move { anyhow::bail!("child boom") })
+                    })),
+            )
+            .run()
+            .await;
+        assert!(result.unwrap_err().to_string().contains("child boom"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_step_runs_n_workers() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+
+        Scenario::new()
+            .parallel(Parallel::named("p").step(
+                Step::named("w").workers(4).run_readonly(move |_ctx| {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            ))
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn concurrent_step_fails_if_any_worker_fails() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+
+        let result = Scenario::new()
+            .parallel(Parallel::named("p").step(
+                Step::named("w").workers(4).run_readonly(move |_ctx| {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        let n = c.fetch_add(1, Ordering::SeqCst);
+                        if n == 2 {
+                            anyhow::bail!("worker {} failed", n);
+                        }
+                        Ok(())
+                    })
+                }),
+            ))
+            .run()
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn hooks_are_step_level_not_worker_level() {
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let b = before.clone();
+        let a = after.clone();
+
+        Scenario::new()
+            .hook(Hook::before_step("before", move |_ctx, _info| {
+                let c = b.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }))
+            .hook(Hook::after_step("after", move |_ctx, _info| {
+                let c = a.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }))
+            .parallel(Parallel::named("p").step(
+                Step::named("w")
+                    .workers(8)
+                    .run_readonly(|_ctx| Box::pin(async move { Ok(()) })),
+            ))
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_sink_collects_events_from_workers() {
+        let scenario = Scenario::new().parallel(
+            Parallel::named("p")
+                .step(Step::named("reads").workers(3).run_readonly(|ctx| {
+                    Box::pin(async move {
+                        ctx.runtime().metrics().counter("read.success", 1);
+                        ctx.runtime().metrics().latency(
+                            "read.latency",
+                            Duration::from_millis(1),
+                        );
+                        Ok(())
+                    })
+                }))
+                .step(Step::named("monitor").run_readonly(|ctx| {
+                    Box::pin(async move {
+                        ctx.runtime()
+                            .metrics()
+                            .event("monitor", "hello");
+                        Ok(())
+                    })
+                })),
+        );
+
+        let (result, store) = scenario.run_inner().await;
+        result.unwrap();
+
+        assert_eq!(store.counters.get("read.success").copied(), Some(3));
+        assert_eq!(
+            store.latencies.get("read.latency").map(|v| v.len()),
+            Some(3)
+        );
+        assert!(store.events.iter().any(|e| matches!(
+            e,
+            crate::metrics::MetricEvent::Event { name, .. } if name == "monitor"
+        )));
+    }
+
+    #[tokio::test]
+    async fn top_level_mutable_step_still_uses_mutable_context() {
+        Scenario::new()
+            .step(Step::named("seed").run(|ctx| {
+                Box::pin(async move {
+                    ctx.insert(COUNTER, 7);
+                    Ok(())
+                })
+            }))
+            .step(Step::named("check").run(|ctx| {
+                Box::pin(async move {
+                    assert_eq!(*ctx.get(COUNTER)?, 7);
+                    Ok(())
+                })
+            }))
+            .run()
+            .await
+            .unwrap();
     }
 }

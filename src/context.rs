@@ -2,6 +2,7 @@ use std::any::{Any, type_name};
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::metrics::MetricsSink;
 use crate::slot::Slot;
 
 /// Dynamic storage for typed values keyed by [`Slot`].
@@ -17,28 +18,50 @@ impl Extensions {
     }
 }
 
-/// Runtime context (empty for the initial version).
-pub struct RuntimeContext {}
+/// Framework-owned runtime capabilities available to steps and hooks.
+///
+/// Currently exposes only a [`MetricsSink`]; future runtime features
+/// (deadlines, cancellation, etc.) can live here too.
+pub struct RuntimeContext {
+    metrics: MetricsSink,
+}
 
 impl RuntimeContext {
-    fn new() -> Self {
-        Self {}
+    pub(crate) fn new(metrics: MetricsSink) -> Self {
+        Self { metrics }
+    }
+
+    pub fn metrics(&self) -> &MetricsSink {
+        &self.metrics
     }
 }
 
 /// Central state container passed to every [`Step`](crate::Step).
 pub struct Context {
-    #[allow(dead_code)]
     runtime: RuntimeContext,
     extensions: Extensions,
 }
 
 impl Context {
+    /// Create a context with a standalone metrics sink whose receiver is
+    /// discarded. Useful for unit tests that exercise [`Context`] directly.
     pub fn new() -> Self {
+        let (sink, _rx) = MetricsSink::new();
         Self {
-            runtime: RuntimeContext::new(),
+            runtime: RuntimeContext::new(sink),
             extensions: Extensions::new(),
         }
+    }
+
+    pub(crate) fn with_metrics(metrics: MetricsSink) -> Self {
+        Self {
+            runtime: RuntimeContext::new(metrics),
+            extensions: Extensions::new(),
+        }
+    }
+
+    pub fn runtime(&self) -> &RuntimeContext {
+        &self.runtime
     }
 
     /// Insert a value into the context. Returns the previous value if one existed.
