@@ -116,16 +116,10 @@ impl Step {
         match &self.runner {
             StepRunner::Mutable(f) => {
                 if self.policy.workers != 1 {
-                    anyhow::bail!(
-                        "step '{}': workers > 1 requires run_readonly",
-                        self.name
-                    );
+                    anyhow::bail!("step '{}': workers > 1 requires run_readonly", self.name);
                 }
                 if self.policy.duration.is_some() {
-                    anyhow::bail!(
-                        "step '{}': duration requires run_readonly",
-                        self.name
-                    );
+                    anyhow::bail!("step '{}': duration requires run_readonly", self.name);
                 }
                 f(ctx).await
             }
@@ -141,10 +135,7 @@ impl Step {
         match &self.runner {
             StepRunner::ReadOnly(f) => execute_readonly(&self.name, f, &self.policy, ctx).await,
             StepRunner::Mutable(_) => {
-                anyhow::bail!(
-                    "step '{}' inside Parallel must use run_readonly",
-                    self.name
-                );
+                anyhow::bail!("step '{}' inside Parallel must use run_readonly", self.name);
             }
             StepRunner::None => {
                 anyhow::bail!("step '{}' has no function attached", self.name)
@@ -174,11 +165,7 @@ async fn execute_readonly(
     }
 }
 
-async fn worker_loop(
-    f: &ReadOnlyStepFn,
-    ctx: &Context,
-    duration: Option<Duration>,
-) -> Result<()> {
+async fn worker_loop(f: &ReadOnlyStepFn, ctx: &Context, duration: Option<Duration>) -> Result<()> {
     match duration {
         None => f(ctx).await,
         Some(d) => {

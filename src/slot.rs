@@ -51,7 +51,7 @@ mod tests {
     fn slot_copy_clone() {
         let slot: Slot<i32> = Slot::new("x");
         let copied = slot;
-        let cloned = slot.clone();
+        let cloned = slot;
         assert_eq!(slot, copied);
         assert_eq!(slot, cloned);
     }

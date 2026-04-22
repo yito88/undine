@@ -93,8 +93,7 @@ where
     }
 
     let n = futures.len();
-    let futs: Vec<Option<Pin<Box<F>>>> =
-        futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let futs: Vec<Option<Pin<Box<F>>>> = futures.into_iter().map(|f| Some(Box::pin(f))).collect();
     let results: Vec<Option<F::Output>> = (0..n).map(|_| None).collect();
     JoinAll { futs, results }.await
 }

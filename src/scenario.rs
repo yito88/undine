@@ -172,9 +172,10 @@ mod tests {
     #[tokio::test]
     async fn scenario_stops_on_failure() {
         let result = Scenario::new()
-            .step(Step::named("fail").run(|_ctx| {
-                Box::pin(async move { anyhow::bail!("intentional failure") })
-            }))
+            .step(
+                Step::named("fail")
+                    .run(|_ctx| Box::pin(async move { anyhow::bail!("intentional failure") })),
+            )
             .step(Step::named("never_reached").run(|ctx| {
                 Box::pin(async move {
                     ctx.insert(COUNTER, 999);
@@ -300,10 +301,7 @@ mod tests {
             .step(Step::named("assert").run(|ctx| {
                 Box::pin(async move {
                     let events = ctx.get(EVENTS)?.clone();
-                    assert_eq!(
-                        events,
-                        vec!["b1", "b2", "step", "a1", "a2", "b1", "b2"]
-                    );
+                    assert_eq!(events, vec!["b1", "b2", "step", "a1", "a2", "b1", "b2"]);
                     Ok(())
                 })
             }))
@@ -370,9 +368,10 @@ mod tests {
                 })
             }))
             .step(Step::named("ok").run(|_ctx| Box::pin(async move { Ok(()) })))
-            .step(Step::named("fail").run(|_ctx| {
-                Box::pin(async move { anyhow::bail!("step failed") })
-            }))
+            .step(
+                Step::named("fail")
+                    .run(|_ctx| Box::pin(async move { anyhow::bail!("step failed") })),
+            )
             .run()
             .await;
 
@@ -439,12 +438,12 @@ mod tests {
         let result = Scenario::new()
             .parallel(
                 Parallel::named("p")
-                    .step(Step::named("ok").run_readonly(|_ctx| {
-                        Box::pin(async move { Ok(()) })
-                    }))
-                    .step(Step::named("boom").run_readonly(|_ctx| {
-                        Box::pin(async move { anyhow::bail!("child boom") })
-                    })),
+                    .step(Step::named("ok").run_readonly(|_ctx| Box::pin(async move { Ok(()) })))
+                    .step(
+                        Step::named("boom").run_readonly(|_ctx| {
+                            Box::pin(async move { anyhow::bail!("child boom") })
+                        }),
+                    ),
             )
             .run()
             .await;
@@ -457,15 +456,15 @@ mod tests {
         let c = count.clone();
 
         Scenario::new()
-            .parallel(Parallel::named("p").step(
-                Step::named("w").workers(4).run_readonly(move |_ctx| {
+            .parallel(
+                Parallel::named("p").step(Step::named("w").workers(4).run_readonly(move |_ctx| {
                     let c = c.clone();
                     Box::pin(async move {
                         c.fetch_add(1, Ordering::SeqCst);
                         Ok(())
                     })
-                }),
-            ))
+                })),
+            )
             .run()
             .await
             .unwrap();
@@ -479,8 +478,8 @@ mod tests {
         let c = count.clone();
 
         let result = Scenario::new()
-            .parallel(Parallel::named("p").step(
-                Step::named("w").workers(4).run_readonly(move |_ctx| {
+            .parallel(
+                Parallel::named("p").step(Step::named("w").workers(4).run_readonly(move |_ctx| {
                     let c = c.clone();
                     Box::pin(async move {
                         let n = c.fetch_add(1, Ordering::SeqCst);
@@ -489,8 +488,8 @@ mod tests {
                         }
                         Ok(())
                     })
-                }),
-            ))
+                })),
+            )
             .run()
             .await;
 
@@ -519,11 +518,13 @@ mod tests {
                     Ok(())
                 })
             }))
-            .parallel(Parallel::named("p").step(
-                Step::named("w")
-                    .workers(8)
-                    .run_readonly(|_ctx| Box::pin(async move { Ok(()) })),
-            ))
+            .parallel(
+                Parallel::named("p").step(
+                    Step::named("w")
+                        .workers(8)
+                        .run_readonly(|_ctx| Box::pin(async move { Ok(()) })),
+                ),
+            )
             .run()
             .await
             .unwrap();
@@ -539,18 +540,15 @@ mod tests {
                 .step(Step::named("reads").workers(3).run_readonly(|ctx| {
                     Box::pin(async move {
                         ctx.runtime().metrics().counter("read.success", 1);
-                        ctx.runtime().metrics().latency(
-                            "read.latency",
-                            Duration::from_millis(1),
-                        );
+                        ctx.runtime()
+                            .metrics()
+                            .latency("read.latency", Duration::from_millis(1));
                         Ok(())
                     })
                 }))
                 .step(Step::named("monitor").run_readonly(|ctx| {
                     Box::pin(async move {
-                        ctx.runtime()
-                            .metrics()
-                            .event("monitor", "hello");
+                        ctx.runtime().metrics().event("monitor", "hello");
                         Ok(())
                     })
                 })),

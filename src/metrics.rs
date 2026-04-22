@@ -68,10 +68,7 @@ impl MetricsStore {
                 *self.counters.entry(name.clone()).or_insert(0) += value;
             }
             MetricEvent::Latency { name, value } => {
-                self.latencies
-                    .entry(name.clone())
-                    .or_default()
-                    .push(*value);
+                self.latencies.entry(name.clone()).or_default().push(*value);
             }
             MetricEvent::Event { .. } => {}
         }

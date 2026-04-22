@@ -65,11 +65,7 @@ impl Context {
     }
 
     /// Insert a value into the context. Returns the previous value if one existed.
-    pub fn insert<T: Send + Sync + 'static>(
-        &mut self,
-        slot: Slot<T>,
-        value: T,
-    ) -> Option<T> {
+    pub fn insert<T: Send + Sync + 'static>(&mut self, slot: Slot<T>, value: T) -> Option<T> {
         self.extensions
             .map
             .insert(slot.name(), Box::new(value))
@@ -77,18 +73,15 @@ impl Context {
     }
 
     /// Get an immutable reference to a stored value.
-    pub fn get<T: Send + Sync + 'static>(
-        &self,
-        slot: Slot<T>,
-    ) -> Result<&T, ContextError> {
+    pub fn get<T: Send + Sync + 'static>(&self, slot: Slot<T>) -> Result<&T, ContextError> {
         match self.extensions.map.get(slot.name()) {
-            Some(boxed) => boxed.downcast_ref::<T>().ok_or_else(|| {
-                ContextError::TypeMismatch {
+            Some(boxed) => boxed
+                .downcast_ref::<T>()
+                .ok_or_else(|| ContextError::TypeMismatch {
                     slot_name: slot.name(),
                     expected: type_name::<T>(),
-                    actual: boxed.type_id(),
-                }
-            }),
+                    actual: (**boxed).type_id(),
+                }),
             None => Err(ContextError::NotFound {
                 slot_name: slot.name(),
                 expected: type_name::<T>(),
@@ -110,7 +103,7 @@ impl Context {
             });
         }
         // Check type first via immutable borrow to capture type_id if needed.
-        let actual_type_id = self.extensions.map[slot.name()].type_id();
+        let actual_type_id = (*self.extensions.map[slot.name()]).type_id();
         let boxed = self.extensions.map.get_mut(slot.name()).unwrap();
         boxed.downcast_mut::<T>().ok_or(ContextError::TypeMismatch {
             slot_name: slot.name(),
@@ -120,10 +113,7 @@ impl Context {
     }
 
     /// Remove a value from the context and return it.
-    pub fn remove<T: Send + Sync + 'static>(
-        &mut self,
-        slot: Slot<T>,
-    ) -> Result<T, ContextError> {
+    pub fn remove<T: Send + Sync + 'static>(&mut self, slot: Slot<T>) -> Result<T, ContextError> {
         let registered = self.registered_slots();
         match self.extensions.map.remove(slot.name()) {
             Some(boxed) => boxed.downcast::<T>().map(|b| *b).map_err(|boxed| {
@@ -132,7 +122,7 @@ impl Context {
                 ContextError::TypeMismatch {
                     slot_name: slot.name(),
                     expected: type_name::<T>(),
-                    actual: self.extensions.map[slot.name()].type_id(),
+                    actual: (*self.extensions.map[slot.name()]).type_id(),
                 }
             }),
             None => Err(ContextError::NotFound {
