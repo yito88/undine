@@ -19,3 +19,6 @@ name = "parallel_metrics"
 
 [[example]]
 name = "params"
+
+[[example]]
+name = "sweep"
