@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::metrics::MetricsSink;
+use crate::params::Params;
 use crate::slot::Slot;
 
 /// Dynamic storage for typed values keyed by [`Slot`].
@@ -20,19 +21,24 @@ impl Extensions {
 
 /// Framework-owned runtime capabilities available to steps and hooks.
 ///
-/// Currently exposes only a [`MetricsSink`]; future runtime features
-/// (deadlines, cancellation, etc.) can live here too.
+/// Exposes a [`MetricsSink`] and read-only [`Params`]; future runtime
+/// features (deadlines, cancellation, etc.) can live here too.
 pub struct RuntimeContext {
     metrics: MetricsSink,
+    params: Params,
 }
 
 impl RuntimeContext {
-    pub(crate) fn new(metrics: MetricsSink) -> Self {
-        Self { metrics }
+    pub(crate) fn new(metrics: MetricsSink, params: Params) -> Self {
+        Self { metrics, params }
     }
 
     pub fn metrics(&self) -> &MetricsSink {
         &self.metrics
+    }
+
+    pub fn params(&self) -> &Params {
+        &self.params
     }
 }
 
@@ -44,18 +50,19 @@ pub struct Context {
 
 impl Context {
     /// Create a context with a standalone metrics sink whose receiver is
-    /// discarded. Useful for unit tests that exercise [`Context`] directly.
+    /// discarded and empty params. Useful for unit tests that exercise
+    /// [`Context`] directly.
     pub fn new() -> Self {
         let (sink, _rx) = MetricsSink::new();
         Self {
-            runtime: RuntimeContext::new(sink),
+            runtime: RuntimeContext::new(sink, Params::empty()),
             extensions: Extensions::new(),
         }
     }
 
-    pub(crate) fn with_metrics(metrics: MetricsSink) -> Self {
+    pub(crate) fn with_runtime(metrics: MetricsSink, params: Params) -> Self {
         Self {
-            runtime: RuntimeContext::new(metrics),
+            runtime: RuntimeContext::new(metrics, params),
             extensions: Extensions::new(),
         }
     }
