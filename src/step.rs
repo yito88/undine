@@ -128,7 +128,7 @@ impl Step {
                         self.name
                     )));
                 }
-                f(ctx).await.map_err(ExecError::Step)
+                f(ctx).await.map_err(|e| ExecError::Step(vec![e]))
             }
             StepRunner::ReadOnly(f) => execute_readonly(f, &self.policy, ctx).await,
             StepRunner::None => Err(ExecError::Framework(anyhow::anyhow!(
@@ -163,16 +163,18 @@ async fn execute_readonly(
     if workers == 1 {
         worker_loop(f, ctx, policy.duration)
             .await
-            .map_err(ExecError::Step)
+            .map_err(|e| ExecError::Step(vec![e]))
     } else {
         let futs: Vec<_> = (0..workers)
             .map(|_| worker_loop(f, ctx, policy.duration))
             .collect();
         let results = crate::parallel::join_all(futs).await;
-        for r in results {
-            r.map_err(ExecError::Step)?;
+        let errors: Vec<anyhow::Error> = results.into_iter().filter_map(|r| r.err()).collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecError::Step(errors))
         }
-        Ok(())
     }
 }
 
@@ -274,7 +276,23 @@ mod tests {
         let mut ctx = Context::new();
         let err = step.execute_top(&mut ctx).await.unwrap_err();
         match err {
-            ExecError::Step(e) => assert!(e.to_string().contains("oops")),
+            ExecError::Step(errors) => {
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].to_string().contains("oops"));
+            }
+            ExecError::Framework(_) => panic!("expected Step error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_step_collects_all_worker_errors() {
+        let step = Step::named("boom")
+            .workers(4)
+            .run_readonly(|_ctx| Box::pin(async move { anyhow::bail!("worker failed") }));
+        let mut ctx = Context::new();
+        let err = step.execute_top(&mut ctx).await.unwrap_err();
+        match err {
+            ExecError::Step(errors) => assert_eq!(errors.len(), 4),
             ExecError::Framework(_) => panic!("expected Step error"),
         }
     }

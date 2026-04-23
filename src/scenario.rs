@@ -51,11 +51,13 @@ impl Scenario {
 
     /// Execute the scenario.
     ///
-    /// Returns a [`RunSummary`] describing the run. If a user step body
-    /// returned `Err`, the summary's `success` is `false` and `error`
-    /// carries the message. Framework failures (hook errors, policy
-    /// violations) propagate out as `Err` — they indicate a bug in the
-    /// test code or Undine itself rather than an observed test outcome.
+    /// Returns a [`RunSummary`] describing the run. If one or more user
+    /// step bodies returned `Err`, the summary's `success` is `false` and
+    /// `error_count` reflects the total number of failures; each error is
+    /// written to stderr as it's reported. Framework failures (hook
+    /// errors, policy violations) propagate out as `Err` — they indicate
+    /// a bug in the test code or Undine itself rather than an observed
+    /// test outcome.
     pub async fn run(self) -> Result<RunSummary> {
         let (sink, mut rx) = MetricsSink::new();
         let mut ctx = Context::with_metrics(sink);
@@ -72,15 +74,20 @@ impl Scenario {
             Ok(()) => Ok(RunSummary {
                 success: true,
                 duration,
-                error: None,
+                error_count: 0,
                 metrics,
             }),
-            Err(ExecError::Step(e)) => Ok(RunSummary {
-                success: false,
-                duration,
-                error: Some(e.to_string()),
-                metrics,
-            }),
+            Err(ExecError::Step(errors)) => {
+                for e in &errors {
+                    eprintln!("[undine] step error: {e}");
+                }
+                Ok(RunSummary {
+                    success: false,
+                    duration,
+                    error_count: errors.len() as u64,
+                    metrics,
+                })
+            }
             Err(ExecError::Framework(e)) => Err(e),
         }
     }
@@ -218,13 +225,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!summary.success);
-        assert!(
-            summary
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("intentional failure")
-        );
+        assert_eq!(summary.error_count, 1);
     }
 
     #[tokio::test]
@@ -490,7 +491,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!summary.success);
-        assert!(summary.error.as_deref().unwrap().contains("child boom"));
+        assert_eq!(summary.error_count, 1);
     }
 
     #[tokio::test]
@@ -538,7 +539,8 @@ mod tests {
             .unwrap();
 
         assert!(!summary.success);
-        assert!(summary.error.as_deref().unwrap().contains("failed"));
+        // Exactly one worker (the 3rd, n == 2) bails.
+        assert_eq!(summary.error_count, 1);
     }
 
     #[tokio::test]
@@ -635,14 +637,84 @@ mod tests {
     // ----- New: RunSummary surface -----
 
     #[tokio::test]
-    async fn successful_run_sets_success_and_no_error() {
+    async fn successful_run_sets_success_and_zero_error_count() {
         let summary = Scenario::new()
             .step(Step::named("noop").run(|_ctx| Box::pin(async move { Ok(()) })))
             .run()
             .await
             .unwrap();
         assert!(summary.success);
-        assert!(summary.error.is_none());
+        assert_eq!(summary.error_count, 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_collects_every_child_failure() {
+        let summary =
+            Scenario::new()
+                .parallel(
+                    Parallel::named("p")
+                        .step(Step::named("a").run_readonly(|_ctx| {
+                            Box::pin(async move { anyhow::bail!("a failed") })
+                        }))
+                        .step(Step::named("b").run_readonly(|_ctx| {
+                            Box::pin(async move { anyhow::bail!("b failed") })
+                        }))
+                        .step(Step::named("c").run_readonly(|_ctx| {
+                            Box::pin(async move { anyhow::bail!("c failed") })
+                        })),
+                )
+                .run()
+                .await
+                .unwrap();
+
+        assert!(!summary.success);
+        assert_eq!(summary.error_count, 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_workers_all_fail_collects_all() {
+        let summary = Scenario::new()
+            .parallel(
+                Parallel::named("p").step(
+                    Step::named("w")
+                        .workers(4)
+                        .run_readonly(|_ctx| Box::pin(async move { anyhow::bail!("worker x") })),
+                ),
+            )
+            .run()
+            .await
+            .unwrap();
+
+        assert!(!summary.success);
+        assert_eq!(summary.error_count, 4);
+    }
+
+    #[tokio::test]
+    async fn mixed_success_and_failure_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = Arc::new(AtomicUsize::new(0));
+        let nc = n.clone();
+
+        let summary = Scenario::new()
+            .parallel(
+                Parallel::named("p").step(Step::named("w").workers(4).run_readonly(move |_ctx| {
+                    let nc = nc.clone();
+                    Box::pin(async move {
+                        let i = nc.fetch_add(1, Ordering::SeqCst);
+                        // two of four workers fail
+                        if i.is_multiple_of(2) {
+                            anyhow::bail!("worker {} failed", i);
+                        }
+                        Ok(())
+                    })
+                })),
+            )
+            .run()
+            .await
+            .unwrap();
+
+        assert!(!summary.success);
+        assert_eq!(summary.error_count, 2);
     }
 
     #[tokio::test]

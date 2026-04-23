@@ -5,15 +5,20 @@ use crate::metrics::MetricsStore;
 
 /// The result of a single scenario run.
 ///
-/// Always contains `duration` and aggregated `metrics`. If a user step body
-/// returned `Err`, `success` is `false` and `error` carries the error
-/// message. Framework errors (hook failures, policy violations) do not
-/// produce a `RunSummary` — they surface as `Err` from `Scenario::run`.
+/// Always contains `duration` and aggregated `metrics`. If any user step
+/// body returned `Err`, `success` is `false` and `error_count` reflects
+/// how many step failures occurred across the run (including every worker
+/// inside a concurrent step or `Parallel` block). The actual error
+/// messages are logged during the run; the summary stays lightweight so
+/// it remains cheap to display, serialize, and compare across runs.
+///
+/// Framework errors (hook failures, policy violations) do not produce a
+/// `RunSummary` — they surface as `Err` from `Scenario::run`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunSummary {
     pub success: bool,
     pub duration: Duration,
-    pub error: Option<String>,
+    pub error_count: u64,
     pub metrics: MetricsSummary,
 }
 

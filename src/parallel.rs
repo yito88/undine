@@ -40,28 +40,25 @@ impl Parallel {
     /// Run all child step bodies concurrently against a shared `&Context`.
     ///
     /// Aggregation rule: a framework error from any child dominates and is
-    /// returned immediately; otherwise the first step error encountered is
-    /// returned. This preserves the distinction between test outcomes
-    /// (step failures) and harness bugs (framework failures).
+    /// returned as-is (first one wins). Otherwise all step errors from all
+    /// children are concatenated into a single `ExecError::Step` so the
+    /// run summary can report every failure.
     pub(crate) async fn execute_bodies(&self, ctx: &Context) -> Result<(), ExecError> {
         let futs: Vec<_> = self.steps.iter().map(|s| s.execute_child(ctx)).collect();
         let results = join_all(futs).await;
-        let mut first_step_err: Option<anyhow::Error> = None;
+        let mut step_errors: Vec<anyhow::Error> = Vec::new();
         for r in results {
             match r {
                 Ok(()) => {}
                 Err(ExecError::Framework(e)) => return Err(ExecError::Framework(e)),
-                Err(ExecError::Step(e)) => {
-                    if first_step_err.is_none() {
-                        first_step_err = Some(e);
-                    }
-                }
+                Err(ExecError::Step(mut errs)) => step_errors.append(&mut errs),
             }
         }
-        if let Some(e) = first_step_err {
-            return Err(ExecError::Step(e));
+        if step_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecError::Step(step_errors))
         }
-        Ok(())
     }
 }
 

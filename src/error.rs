@@ -11,6 +11,9 @@
 ///   or in Undine itself rather than observed test outcomes.
 #[derive(Debug)]
 pub(crate) enum ExecError {
-    Step(anyhow::Error),
+    /// One or more user step bodies failed. Within a concurrent block
+    /// (workers, `Parallel`) we collect every failure rather than stopping
+    /// at the first, so a run summary can report a complete picture.
+    Step(Vec<anyhow::Error>),
     Framework(anyhow::Error),
 }
