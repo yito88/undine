@@ -52,7 +52,7 @@ async fn log_end(_ctx: &mut Context, info: &StepInfo<'_>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    Scenario::new()
+    let summary = Scenario::new()
         .hook(Hook::before_step("log-start", hook_fn!(log_start)))
         .hook(Hook::after_step("log-end", hook_fn!(log_end)))
         .step(Step::named("setup").run(step_fn!(setup)))
@@ -74,5 +74,9 @@ async fn main() -> Result<()> {
         )
         .step(Step::named("validate").run(step_fn!(validate)))
         .run()
-        .await
+        .await?;
+
+    println!("\n--- Run summary ---");
+    println!("{summary:#?}");
+    Ok(())
 }

@@ -2,9 +2,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
-use anyhow::Result;
-
 use crate::context::Context;
+use crate::error::ExecError;
 use crate::step::Step;
 
 /// A heterogeneous concurrency block.
@@ -39,11 +38,28 @@ impl Parallel {
     }
 
     /// Run all child step bodies concurrently against a shared `&Context`.
-    pub(crate) async fn execute_bodies(&self, ctx: &Context) -> Result<()> {
+    ///
+    /// Aggregation rule: a framework error from any child dominates and is
+    /// returned immediately; otherwise the first step error encountered is
+    /// returned. This preserves the distinction between test outcomes
+    /// (step failures) and harness bugs (framework failures).
+    pub(crate) async fn execute_bodies(&self, ctx: &Context) -> Result<(), ExecError> {
         let futs: Vec<_> = self.steps.iter().map(|s| s.execute_child(ctx)).collect();
         let results = join_all(futs).await;
+        let mut first_step_err: Option<anyhow::Error> = None;
         for r in results {
-            r?;
+            match r {
+                Ok(()) => {}
+                Err(ExecError::Framework(e)) => return Err(ExecError::Framework(e)),
+                Err(ExecError::Step(e)) => {
+                    if first_step_err.is_none() {
+                        first_step_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_step_err {
+            return Err(ExecError::Step(e));
         }
         Ok(())
     }

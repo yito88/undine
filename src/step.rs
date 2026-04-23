@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::context::Context;
+use crate::error::ExecError;
 
 /// Boxed closure shape for a mutable, top-level step body.
 pub type MutableStepFn = Box<
@@ -112,54 +113,64 @@ impl Step {
     }
 
     /// Execute this step as a top-level scenario node.
-    pub(crate) async fn execute_top(&self, ctx: &mut Context) -> Result<()> {
+    pub(crate) async fn execute_top(&self, ctx: &mut Context) -> Result<(), ExecError> {
         match &self.runner {
             StepRunner::Mutable(f) => {
                 if self.policy.workers != 1 {
-                    anyhow::bail!("step '{}': workers > 1 requires run_readonly", self.name);
+                    return Err(ExecError::Framework(anyhow::anyhow!(
+                        "step '{}': workers > 1 requires run_readonly",
+                        self.name
+                    )));
                 }
                 if self.policy.duration.is_some() {
-                    anyhow::bail!("step '{}': duration requires run_readonly", self.name);
+                    return Err(ExecError::Framework(anyhow::anyhow!(
+                        "step '{}': duration requires run_readonly",
+                        self.name
+                    )));
                 }
-                f(ctx).await
+                f(ctx).await.map_err(ExecError::Step)
             }
-            StepRunner::ReadOnly(f) => execute_readonly(&self.name, f, &self.policy, ctx).await,
-            StepRunner::None => {
-                anyhow::bail!("step '{}' has no function attached", self.name)
-            }
+            StepRunner::ReadOnly(f) => execute_readonly(f, &self.policy, ctx).await,
+            StepRunner::None => Err(ExecError::Framework(anyhow::anyhow!(
+                "step '{}' has no function attached",
+                self.name
+            ))),
         }
     }
 
     /// Execute this step as a child inside a [`Parallel`](crate::Parallel).
-    pub(crate) async fn execute_child(&self, ctx: &Context) -> Result<()> {
+    pub(crate) async fn execute_child(&self, ctx: &Context) -> Result<(), ExecError> {
         match &self.runner {
-            StepRunner::ReadOnly(f) => execute_readonly(&self.name, f, &self.policy, ctx).await,
-            StepRunner::Mutable(_) => {
-                anyhow::bail!("step '{}' inside Parallel must use run_readonly", self.name);
-            }
-            StepRunner::None => {
-                anyhow::bail!("step '{}' has no function attached", self.name)
-            }
+            StepRunner::ReadOnly(f) => execute_readonly(f, &self.policy, ctx).await,
+            StepRunner::Mutable(_) => Err(ExecError::Framework(anyhow::anyhow!(
+                "step '{}' inside Parallel must use run_readonly",
+                self.name
+            ))),
+            StepRunner::None => Err(ExecError::Framework(anyhow::anyhow!(
+                "step '{}' has no function attached",
+                self.name
+            ))),
         }
     }
 }
 
 async fn execute_readonly(
-    _name: &str,
     f: &ReadOnlyStepFn,
     policy: &StepPolicy,
     ctx: &Context,
-) -> Result<()> {
+) -> Result<(), ExecError> {
     let workers = policy.workers.max(1);
     if workers == 1 {
-        worker_loop(f, ctx, policy.duration).await
+        worker_loop(f, ctx, policy.duration)
+            .await
+            .map_err(ExecError::Step)
     } else {
         let futs: Vec<_> = (0..workers)
             .map(|_| worker_loop(f, ctx, policy.duration))
             .collect();
         let results = crate::parallel::join_all(futs).await;
         for r in results {
-            r?;
+            r.map_err(ExecError::Step)?;
         }
         Ok(())
     }
@@ -243,14 +254,29 @@ mod tests {
 
         let mut ctx = Context::new();
         let err = step.execute_top(&mut ctx).await.unwrap_err();
-        assert!(err.to_string().contains("requires run_readonly"));
+        match err {
+            ExecError::Framework(e) => assert!(e.to_string().contains("requires run_readonly")),
+            ExecError::Step(_) => panic!("expected Framework error"),
+        }
     }
 
     #[tokio::test]
     async fn step_without_func_errors() {
         let step = Step::named("empty");
         let mut ctx = Context::new();
-        assert!(step.execute_top(&mut ctx).await.is_err());
+        let err = step.execute_top(&mut ctx).await.unwrap_err();
+        assert!(matches!(err, ExecError::Framework(_)));
+    }
+
+    #[tokio::test]
+    async fn mutable_step_body_failure_is_step_error() {
+        let step = Step::named("boom").run(|_ctx| Box::pin(async move { anyhow::bail!("oops") }));
+        let mut ctx = Context::new();
+        let err = step.execute_top(&mut ctx).await.unwrap_err();
+        match err {
+            ExecError::Step(e) => assert!(e.to_string().contains("oops")),
+            ExecError::Framework(_) => panic!("expected Step error"),
+        }
     }
 
     #[tokio::test]

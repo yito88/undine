@@ -1,10 +1,14 @@
+use std::time::Instant;
+
 use anyhow::Result;
 
 use crate::context::Context;
+use crate::error::ExecError;
 use crate::hook::{Hook, HookPoint, StepInfo};
 use crate::metrics::{MetricsSink, MetricsStore};
 use crate::parallel::Parallel;
 use crate::step::Step;
+use crate::summary::{RunSummary, build_metrics_summary};
 
 /// A top-level unit of scenario execution.
 pub(crate) enum Node {
@@ -45,22 +49,40 @@ impl Scenario {
         self
     }
 
-    /// Execute the scenario. The first error stops execution.
-    pub async fn run(self) -> Result<()> {
-        let (result, _store) = self.run_inner().await;
-        result
-    }
-
-    /// Test-only hook that returns the collected metrics alongside the
-    /// scenario result. Kept crate-private; a public reporting API is
-    /// out of scope for this iteration.
-    pub(crate) async fn run_inner(self) -> (Result<()>, MetricsStore) {
+    /// Execute the scenario.
+    ///
+    /// Returns a [`RunSummary`] describing the run. If a user step body
+    /// returned `Err`, the summary's `success` is `false` and `error`
+    /// carries the message. Framework failures (hook errors, policy
+    /// violations) propagate out as `Err` — they indicate a bug in the
+    /// test code or Undine itself rather than an observed test outcome.
+    pub async fn run(self) -> Result<RunSummary> {
         let (sink, mut rx) = MetricsSink::new();
         let mut ctx = Context::with_metrics(sink);
+
+        let start = Instant::now();
         let result = execute_nodes(&self.nodes, &self.hooks, &mut ctx).await;
+        let duration = start.elapsed();
+
         drop(ctx);
         let store = MetricsStore::drain_from(&mut rx);
-        (result, store)
+        let metrics = build_metrics_summary(&store, duration);
+
+        match result {
+            Ok(()) => Ok(RunSummary {
+                success: true,
+                duration,
+                error: None,
+                metrics,
+            }),
+            Err(ExecError::Step(e)) => Ok(RunSummary {
+                success: false,
+                duration,
+                error: Some(e.to_string()),
+                metrics,
+            }),
+            Err(ExecError::Framework(e)) => Err(e),
+        }
     }
 }
 
@@ -70,21 +92,27 @@ impl Default for Scenario {
     }
 }
 
-async fn execute_nodes(nodes: &[Node], hooks: &[Hook], ctx: &mut Context) -> Result<()> {
+async fn execute_nodes(nodes: &[Node], hooks: &[Hook], ctx: &mut Context) -> Result<(), ExecError> {
     for node in nodes {
         match node {
             Node::Step(step) => {
                 let info = StepInfo { name: step.name() };
-                run_hooks(hooks, HookPoint::BeforeStep, ctx, &info).await?;
+                run_hooks(hooks, HookPoint::BeforeStep, ctx, &info)
+                    .await
+                    .map_err(ExecError::Framework)?;
                 step.execute_top(ctx).await?;
-                run_hooks(hooks, HookPoint::AfterStep, ctx, &info).await?;
+                run_hooks(hooks, HookPoint::AfterStep, ctx, &info)
+                    .await
+                    .map_err(ExecError::Framework)?;
             }
             Node::Parallel(par) => {
                 // Hooks are step-level. Before-hooks for each child run
                 // sequentially (with `&mut Context`) before any body starts.
                 for step in par.steps() {
                     let info = StepInfo { name: step.name() };
-                    run_hooks(hooks, HookPoint::BeforeStep, ctx, &info).await?;
+                    run_hooks(hooks, HookPoint::BeforeStep, ctx, &info)
+                        .await
+                        .map_err(ExecError::Framework)?;
                 }
 
                 let block_result = par.execute_bodies(&*ctx).await;
@@ -95,7 +123,9 @@ async fn execute_nodes(nodes: &[Node], hooks: &[Hook], ctx: &mut Context) -> Res
                 if block_result.is_ok() {
                     for step in par.steps() {
                         let info = StepInfo { name: step.name() };
-                        run_hooks(hooks, HookPoint::AfterStep, ctx, &info).await?;
+                        run_hooks(hooks, HookPoint::AfterStep, ctx, &info)
+                            .await
+                            .map_err(ExecError::Framework)?;
                     }
                 }
 
@@ -106,6 +136,8 @@ async fn execute_nodes(nodes: &[Node], hooks: &[Hook], ctx: &mut Context) -> Res
     Ok(())
 }
 
+/// Hook failures are always framework errors; callers wrap with
+/// [`ExecError::Framework`].
 async fn run_hooks(
     hooks: &[Hook],
     point: HookPoint,
@@ -171,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn scenario_stops_on_failure() {
-        let result = Scenario::new()
+        let summary = Scenario::new()
             .step(
                 Step::named("fail")
                     .run(|_ctx| Box::pin(async move { anyhow::bail!("intentional failure") })),
@@ -183,8 +215,16 @@ mod tests {
                 })
             }))
             .run()
-            .await;
-        assert!(result.is_err());
+            .await
+            .unwrap();
+        assert!(!summary.success);
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("intentional failure")
+        );
     }
 
     #[tokio::test]
@@ -352,7 +392,7 @@ mod tests {
         let b = before_hits.clone();
         let a = after_hits.clone();
 
-        let result = Scenario::new()
+        let summary = Scenario::new()
             .hook(Hook::before_step("count-before", move |_ctx, _info| {
                 let c = b.clone();
                 Box::pin(async move {
@@ -373,9 +413,10 @@ mod tests {
                     .run(|_ctx| Box::pin(async move { anyhow::bail!("step failed") })),
             )
             .run()
-            .await;
+            .await
+            .unwrap();
 
-        assert!(result.is_err());
+        assert!(!summary.success);
         assert_eq!(before_hits.load(Ordering::SeqCst), 2);
         assert_eq!(after_hits.load(Ordering::SeqCst), 1);
     }
@@ -435,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_fails_if_any_child_fails() {
-        let result = Scenario::new()
+        let summary = Scenario::new()
             .parallel(
                 Parallel::named("p")
                     .step(Step::named("ok").run_readonly(|_ctx| Box::pin(async move { Ok(()) })))
@@ -446,8 +487,10 @@ mod tests {
                     ),
             )
             .run()
-            .await;
-        assert!(result.unwrap_err().to_string().contains("child boom"));
+            .await
+            .unwrap();
+        assert!(!summary.success);
+        assert!(summary.error.as_deref().unwrap().contains("child boom"));
     }
 
     #[tokio::test]
@@ -477,7 +520,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
 
-        let result = Scenario::new()
+        let summary = Scenario::new()
             .parallel(
                 Parallel::named("p").step(Step::named("w").workers(4).run_readonly(move |_ctx| {
                     let c = c.clone();
@@ -491,9 +534,11 @@ mod tests {
                 })),
             )
             .run()
-            .await;
+            .await
+            .unwrap();
 
-        assert!(result.is_err());
+        assert!(!summary.success);
+        assert!(summary.error.as_deref().unwrap().contains("failed"));
     }
 
     #[tokio::test]
@@ -534,38 +579,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_sink_collects_events_from_workers() {
-        let scenario = Scenario::new().parallel(
-            Parallel::named("p")
-                .step(Step::named("reads").workers(3).run_readonly(|ctx| {
-                    Box::pin(async move {
-                        ctx.runtime().metrics().counter("read.success", 1);
-                        ctx.runtime()
-                            .metrics()
-                            .latency("read.latency", Duration::from_millis(1));
-                        Ok(())
-                    })
-                }))
-                .step(Step::named("monitor").run_readonly(|ctx| {
-                    Box::pin(async move {
-                        ctx.runtime().metrics().event("monitor", "hello");
-                        Ok(())
-                    })
-                })),
-        );
+    async fn summary_aggregates_events_from_concurrent_workers() {
+        let summary = Scenario::new()
+            .parallel(
+                Parallel::named("p")
+                    .step(Step::named("reads").workers(3).run_readonly(|ctx| {
+                        Box::pin(async move {
+                            ctx.runtime().metrics().counter("read.success", 1);
+                            ctx.runtime()
+                                .metrics()
+                                .latency("read.latency", Duration::from_millis(1));
+                            Ok(())
+                        })
+                    }))
+                    .step(Step::named("monitor").run_readonly(|ctx| {
+                        Box::pin(async move {
+                            ctx.runtime().metrics().event("monitor", "hello");
+                            Ok(())
+                        })
+                    })),
+            )
+            .run()
+            .await
+            .unwrap();
 
-        let (result, store) = scenario.run_inner().await;
-        result.unwrap();
-
-        assert_eq!(store.counters.get("read.success").copied(), Some(3));
+        assert!(summary.success);
         assert_eq!(
-            store.latencies.get("read.latency").map(|v| v.len()),
+            summary.metrics.counters.get("read.success").copied(),
             Some(3)
         );
-        assert!(store.events.iter().any(|e| matches!(
-            e,
-            crate::metrics::MetricEvent::Event { name, .. } if name == "monitor"
-        )));
+        let lat = summary.metrics.latencies.get("read.latency").unwrap();
+        assert_eq!(lat.count, 3);
     }
 
     #[tokio::test]
@@ -586,5 +630,118 @@ mod tests {
             .run()
             .await
             .unwrap();
+    }
+
+    // ----- New: RunSummary surface -----
+
+    #[tokio::test]
+    async fn successful_run_sets_success_and_no_error() {
+        let summary = Scenario::new()
+            .step(Step::named("noop").run(|_ctx| Box::pin(async move { Ok(()) })))
+            .run()
+            .await
+            .unwrap();
+        assert!(summary.success);
+        assert!(summary.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn duration_is_nonzero_for_real_work() {
+        let summary = Scenario::new()
+            .step(Step::named("sleep").run(|_ctx| {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(())
+                })
+            }))
+            .run()
+            .await
+            .unwrap();
+        assert!(summary.duration >= Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn counters_are_summed_by_name() {
+        let summary = Scenario::new()
+            .step(Step::named("emit").run_readonly(|ctx| {
+                Box::pin(async move {
+                    ctx.runtime().metrics().counter("hits", 2);
+                    ctx.runtime().metrics().counter("hits", 3);
+                    ctx.runtime().metrics().counter("misses", 1);
+                    Ok(())
+                })
+            }))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(summary.metrics.counters.get("hits").copied(), Some(5));
+        assert_eq!(summary.metrics.counters.get("misses").copied(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn latencies_are_grouped_by_name() {
+        let summary = Scenario::new()
+            .step(Step::named("emit").run_readonly(|ctx| {
+                Box::pin(async move {
+                    ctx.runtime()
+                        .metrics()
+                        .latency("read", Duration::from_millis(1));
+                    ctx.runtime()
+                        .metrics()
+                        .latency("read", Duration::from_millis(2));
+                    ctx.runtime()
+                        .metrics()
+                        .latency("write", Duration::from_millis(10));
+                    Ok(())
+                })
+            }))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(summary.metrics.latencies.get("read").unwrap().count, 2);
+        assert_eq!(summary.metrics.latencies.get("write").unwrap().count, 1);
+    }
+
+    #[tokio::test]
+    async fn hook_failure_propagates_as_framework_err() {
+        let err = Scenario::new()
+            .hook(Hook::before_step("boom", |_ctx, _info| {
+                Box::pin(async move { anyhow::bail!("hook boom") })
+            }))
+            .step(Step::named("s").run(|_ctx| Box::pin(async move { Ok(()) })))
+            .run()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("hook boom"));
+    }
+
+    #[tokio::test]
+    async fn hooks_and_workers_both_flow_into_summary() {
+        let summary = Scenario::new()
+            .hook(Hook::after_step("tally", |ctx, info| {
+                let label = info.name.to_string();
+                Box::pin(async move {
+                    ctx.runtime().metrics().counter(format!("after.{label}"), 1);
+                    Ok(())
+                })
+            }))
+            .parallel(
+                Parallel::named("p").step(Step::named("w").workers(3).run_readonly(|ctx| {
+                    Box::pin(async move {
+                        ctx.runtime().metrics().counter("worker.hits", 1);
+                        Ok(())
+                    })
+                })),
+            )
+            .run()
+            .await
+            .unwrap();
+
+        assert!(summary.success);
+        assert_eq!(
+            summary.metrics.counters.get("worker.hits").copied(),
+            Some(3)
+        );
+        assert_eq!(summary.metrics.counters.get("after.w").copied(), Some(1));
     }
 }
