@@ -11,9 +11,10 @@
 ///   or in Undine itself rather than observed test outcomes.
 #[derive(Debug)]
 pub(crate) enum ExecError {
-    /// One or more user step bodies failed. Within a concurrent block
-    /// (workers, `Parallel`) we collect every failure rather than stopping
-    /// at the first, so a run summary can report a complete picture.
-    Step(Vec<anyhow::Error>),
+    /// User step bodies failed. Concurrent workers and `Parallel` children
+    /// all continue running on failure so every error is observed; each
+    /// error is logged at the moment it's detected, and this variant
+    /// carries only the count so the run summary stays lightweight.
+    Step(u64),
     Framework(anyhow::Error),
 }

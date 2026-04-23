@@ -53,11 +53,11 @@ impl Scenario {
     ///
     /// Returns a [`RunSummary`] describing the run. If one or more user
     /// step bodies returned `Err`, the summary's `success` is `false` and
-    /// `error_count` reflects the total number of failures; each error is
-    /// written to stderr as it's reported. Framework failures (hook
-    /// errors, policy violations) propagate out as `Err` — they indicate
-    /// a bug in the test code or Undine itself rather than an observed
-    /// test outcome.
+    /// `error_count` reflects the total number of failures. Each error is
+    /// written to stderr at the moment it's detected; only the count lives
+    /// in the summary. Framework failures (hook errors, policy violations)
+    /// propagate out as `Err` — they indicate a bug in the test code or
+    /// Undine itself rather than an observed test outcome.
     pub async fn run(self) -> Result<RunSummary> {
         let (sink, mut rx) = MetricsSink::new();
         let mut ctx = Context::with_metrics(sink);
@@ -77,17 +77,12 @@ impl Scenario {
                 error_count: 0,
                 metrics,
             }),
-            Err(ExecError::Step(errors)) => {
-                for e in &errors {
-                    eprintln!("[undine] step error: {e}");
-                }
-                Ok(RunSummary {
-                    success: false,
-                    duration,
-                    error_count: errors.len() as u64,
-                    metrics,
-                })
-            }
+            Err(ExecError::Step(count)) => Ok(RunSummary {
+                success: false,
+                duration,
+                error_count: count,
+                metrics,
+            }),
             Err(ExecError::Framework(e)) => Err(e),
         }
     }

@@ -40,24 +40,24 @@ impl Parallel {
     /// Run all child step bodies concurrently against a shared `&Context`.
     ///
     /// Aggregation rule: a framework error from any child dominates and is
-    /// returned as-is (first one wins). Otherwise all step errors from all
-    /// children are concatenated into a single `ExecError::Step` so the
-    /// run summary can report every failure.
+    /// returned as-is (first one wins). Otherwise step-failure counts are
+    /// summed across children. Each child already logged its own errors
+    /// at detection time, so this layer only tallies.
     pub(crate) async fn execute_bodies(&self, ctx: &Context) -> Result<(), ExecError> {
         let futs: Vec<_> = self.steps.iter().map(|s| s.execute_child(ctx)).collect();
         let results = join_all(futs).await;
-        let mut step_errors: Vec<anyhow::Error> = Vec::new();
+        let mut total: u64 = 0;
         for r in results {
             match r {
                 Ok(()) => {}
                 Err(ExecError::Framework(e)) => return Err(ExecError::Framework(e)),
-                Err(ExecError::Step(mut errs)) => step_errors.append(&mut errs),
+                Err(ExecError::Step(n)) => total += n,
             }
         }
-        if step_errors.is_empty() {
+        if total == 0 {
             Ok(())
         } else {
-            Err(ExecError::Step(step_errors))
+            Err(ExecError::Step(total))
         }
     }
 }

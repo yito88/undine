@@ -128,9 +128,15 @@ impl Step {
                         self.name
                     )));
                 }
-                f(ctx).await.map_err(|e| ExecError::Step(vec![e]))
+                match f(ctx).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        log_step_error(&self.name, &e);
+                        Err(ExecError::Step(1))
+                    }
+                }
             }
-            StepRunner::ReadOnly(f) => execute_readonly(f, &self.policy, ctx).await,
+            StepRunner::ReadOnly(f) => execute_readonly(&self.name, f, &self.policy, ctx).await,
             StepRunner::None => Err(ExecError::Framework(anyhow::anyhow!(
                 "step '{}' has no function attached",
                 self.name
@@ -141,7 +147,7 @@ impl Step {
     /// Execute this step as a child inside a [`Parallel`](crate::Parallel).
     pub(crate) async fn execute_child(&self, ctx: &Context) -> Result<(), ExecError> {
         match &self.runner {
-            StepRunner::ReadOnly(f) => execute_readonly(f, &self.policy, ctx).await,
+            StepRunner::ReadOnly(f) => execute_readonly(&self.name, f, &self.policy, ctx).await,
             StepRunner::Mutable(_) => Err(ExecError::Framework(anyhow::anyhow!(
                 "step '{}' inside Parallel must use run_readonly",
                 self.name
@@ -154,26 +160,41 @@ impl Step {
     }
 }
 
+fn log_step_error(name: &str, e: &anyhow::Error) {
+    eprintln!("[undine] step '{name}' failed: {e}");
+}
+
 async fn execute_readonly(
+    name: &str,
     f: &ReadOnlyStepFn,
     policy: &StepPolicy,
     ctx: &Context,
 ) -> Result<(), ExecError> {
     let workers = policy.workers.max(1);
     if workers == 1 {
-        worker_loop(f, ctx, policy.duration)
-            .await
-            .map_err(|e| ExecError::Step(vec![e]))
+        match worker_loop(f, ctx, policy.duration).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                log_step_error(name, &e);
+                Err(ExecError::Step(1))
+            }
+        }
     } else {
         let futs: Vec<_> = (0..workers)
             .map(|_| worker_loop(f, ctx, policy.duration))
             .collect();
         let results = crate::parallel::join_all(futs).await;
-        let errors: Vec<anyhow::Error> = results.into_iter().filter_map(|r| r.err()).collect();
-        if errors.is_empty() {
+        let mut count: u64 = 0;
+        for r in results {
+            if let Err(e) = r {
+                log_step_error(name, &e);
+                count += 1;
+            }
+        }
+        if count == 0 {
             Ok(())
         } else {
-            Err(ExecError::Step(errors))
+            Err(ExecError::Step(count))
         }
     }
 }
@@ -275,26 +296,17 @@ mod tests {
         let step = Step::named("boom").run(|_ctx| Box::pin(async move { anyhow::bail!("oops") }));
         let mut ctx = Context::new();
         let err = step.execute_top(&mut ctx).await.unwrap_err();
-        match err {
-            ExecError::Step(errors) => {
-                assert_eq!(errors.len(), 1);
-                assert!(errors[0].to_string().contains("oops"));
-            }
-            ExecError::Framework(_) => panic!("expected Step error"),
-        }
+        assert!(matches!(err, ExecError::Step(1)));
     }
 
     #[tokio::test]
-    async fn concurrent_step_collects_all_worker_errors() {
+    async fn concurrent_step_counts_all_worker_failures() {
         let step = Step::named("boom")
             .workers(4)
             .run_readonly(|_ctx| Box::pin(async move { anyhow::bail!("worker failed") }));
         let mut ctx = Context::new();
         let err = step.execute_top(&mut ctx).await.unwrap_err();
-        match err {
-            ExecError::Step(errors) => assert_eq!(errors.len(), 4),
-            ExecError::Framework(_) => panic!("expected Step error"),
-        }
+        assert!(matches!(err, ExecError::Step(4)));
     }
 
     #[tokio::test]
