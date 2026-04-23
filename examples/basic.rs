@@ -26,5 +26,6 @@ async fn main() -> Result<()> {
         .step(Step::named("setup").run(step_fn!(setup)))
         .step(Step::named("run").run(step_fn!(run)))
         .run()
-        .await
+        .await?;
+    Ok(())
 }
