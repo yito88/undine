@@ -7,6 +7,7 @@ use crate::error::ExecError;
 use crate::hook::{Hook, HookPoint, StepInfo};
 use crate::metrics::{MetricsSink, MetricsStore};
 use crate::parallel::Parallel;
+use crate::params::Params;
 use crate::step::Step;
 use crate::summary::{RunSummary, build_metrics_summary};
 
@@ -49,7 +50,15 @@ impl Scenario {
         self
     }
 
-    /// Execute the scenario.
+    /// Execute the scenario with empty runtime parameters.
+    ///
+    /// Equivalent to `run_with_params(Params::empty())`. See
+    /// [`Scenario::run_with_params`] for semantics.
+    pub async fn run(self) -> Result<RunSummary> {
+        self.run_with_params(Params::empty()).await
+    }
+
+    /// Execute the scenario with the given runtime parameters.
     ///
     /// Returns a [`RunSummary`] describing the run. If one or more user
     /// step bodies returned `Err`, the summary's `success` is `false` and
@@ -58,9 +67,12 @@ impl Scenario {
     /// in the summary. Framework failures (hook errors, policy violations)
     /// propagate out as `Err` — they indicate a bug in the test code or
     /// Undine itself rather than an observed test outcome.
-    pub async fn run(self) -> Result<RunSummary> {
+    ///
+    /// Steps and workers can read the provided params through
+    /// `ctx.runtime().params()`.
+    pub async fn run_with_params(self, params: Params) -> Result<RunSummary> {
         let (sink, mut rx) = MetricsSink::new();
-        let mut ctx = Context::with_metrics(sink);
+        let mut ctx = Context::with_runtime(sink, params);
 
         let start = Instant::now();
         let result = execute_nodes(&self.nodes, &self.hooks, &mut ctx).await;
@@ -810,5 +822,86 @@ mod tests {
             Some(3)
         );
         assert_eq!(summary.metrics.counters.get("after.w").copied(), Some(1));
+    }
+
+    // ----- New: params injection -----
+
+    #[tokio::test]
+    async fn run_uses_empty_params_by_default() {
+        // Plain run() still works with no params file; missing keys surface
+        // as step errors (not framework errors) because it's user code.
+        let summary = Scenario::new()
+            .step(Step::named("read").run(|ctx| {
+                Box::pin(async move {
+                    // calling a missing key here would fail the step body,
+                    // but no call — this step just verifies params() is
+                    // reachable even when empty.
+                    assert!(!ctx.runtime().params().contains("anything"));
+                    Ok(())
+                })
+            }))
+            .run()
+            .await
+            .unwrap();
+        assert!(summary.success);
+    }
+
+    #[tokio::test]
+    async fn run_with_params_visible_to_top_level_mutable_step() {
+        let params = Params::from_toml_str(
+            r#"
+            [params]
+            workers = 4
+            mode = "fast"
+            "#,
+        )
+        .unwrap();
+
+        let summary = Scenario::new()
+            .step(Step::named("setup").run(|ctx| {
+                Box::pin(async move {
+                    let workers = ctx.runtime().params().get_usize("workers")?;
+                    let mode = ctx.runtime().params().get_str("mode")?;
+                    assert_eq!(workers, 4);
+                    assert_eq!(mode, "fast");
+                    Ok(())
+                })
+            }))
+            .run_with_params(params)
+            .await
+            .unwrap();
+        assert!(summary.success);
+    }
+
+    #[tokio::test]
+    async fn run_with_params_visible_to_readonly_workers() {
+        let params = Params::from_toml_str(
+            r#"
+            [params]
+            read_ratio = 80
+            "#,
+        )
+        .unwrap();
+
+        let summary = Scenario::new()
+            .parallel(
+                Parallel::named("p").step(Step::named("w").workers(3).run_readonly(|ctx| {
+                    Box::pin(async move {
+                        let ratio = ctx.runtime().params().get_u64("read_ratio")?;
+                        ctx.runtime().metrics().counter("ratio_seen", ratio);
+                        Ok(())
+                    })
+                })),
+            )
+            .run_with_params(params)
+            .await
+            .unwrap();
+
+        assert!(summary.success);
+        // 3 workers each emit counter("ratio_seen", 80) -> summed to 240.
+        assert_eq!(
+            summary.metrics.counters.get("ratio_seen").copied(),
+            Some(240)
+        );
     }
 }
