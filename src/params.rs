@@ -21,6 +21,14 @@ impl Params {
         Self::default()
     }
 
+    /// Build a `Params` from an already-parsed flat key/value map.
+    ///
+    /// Primarily used by the sweep loader, which has already split a run
+    /// entry into its metadata (like `name`) and its remaining params.
+    pub fn from_flat_map(inner: HashMap<String, Value>) -> Self {
+        Self { inner }
+    }
+
     /// Parse parameters from a TOML document containing a flat
     /// `[params]` table.
     pub fn from_toml_str(s: &str) -> Result<Self> {

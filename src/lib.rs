@@ -8,6 +8,7 @@ pub mod scenario;
 pub mod slot;
 pub mod step;
 pub mod summary;
+pub mod sweep;
 
 pub use context::{Context, ContextError, RuntimeContext};
 pub use hook::{Hook, HookPoint, StepInfo};
@@ -18,3 +19,4 @@ pub use scenario::Scenario;
 pub use slot::Slot;
 pub use step::{Step, StepPolicy};
 pub use summary::{LatencySummary, MetricsSummary, RunSummary};
+pub use sweep::{NamedRunSummary, RunConfig, RunSuite};

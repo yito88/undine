@@ -10,6 +10,7 @@ use crate::parallel::Parallel;
 use crate::params::Params;
 use crate::step::Step;
 use crate::summary::{RunSummary, build_metrics_summary};
+use crate::sweep::{NamedRunSummary, RunSuite};
 
 /// A top-level unit of scenario execution.
 pub(crate) enum Node {
@@ -52,8 +53,7 @@ impl Scenario {
 
     /// Execute the scenario with empty runtime parameters.
     ///
-    /// Equivalent to `run_with_params(Params::empty())`. See
-    /// [`Scenario::run_with_params`] for semantics.
+    /// Equivalent to `run_with_params(Params::empty())`.
     pub async fn run(self) -> Result<RunSummary> {
         self.run_with_params(Params::empty()).await
     }
@@ -71,6 +71,30 @@ impl Scenario {
     /// Steps and workers can read the provided params through
     /// `ctx.runtime().params()`.
     pub async fn run_with_params(self, params: Params) -> Result<RunSummary> {
+        self.execute_once(params).await
+    }
+
+    /// Execute the scenario once per [`RunConfig`](crate::RunConfig) in
+    /// the suite, sequentially, preserving order.
+    ///
+    /// Step-body failures are recorded in each run's [`RunSummary`] and
+    /// the suite continues to the next run. Framework errors (hook
+    /// failures, policy violations) stop the suite and surface as `Err`
+    /// — they indicate a bug in the test code or Undine itself, not an
+    /// observed test outcome.
+    pub async fn run_suite(self, suite: RunSuite) -> Result<Vec<NamedRunSummary>> {
+        let mut results = Vec::with_capacity(suite.runs.len());
+        for cfg in suite.runs {
+            let summary = self.execute_once(cfg.params).await?;
+            results.push(NamedRunSummary {
+                run_name: cfg.name,
+                summary,
+            });
+        }
+        Ok(results)
+    }
+
+    async fn execute_once(&self, params: Params) -> Result<RunSummary> {
         let (sink, mut rx) = MetricsSink::new();
         let mut ctx = Context::with_runtime(sink, params);
 
@@ -903,5 +927,125 @@ mod tests {
             summary.metrics.counters.get("ratio_seen").copied(),
             Some(240)
         );
+    }
+
+    // ----- New: multi-run sweep execution -----
+
+    #[tokio::test]
+    async fn run_suite_executes_runs_in_order_with_their_params() {
+        let suite = crate::RunSuite::from_toml_str(
+            r#"
+            [[runs]]
+            name = "small"
+            target = 1
+
+            [[runs]]
+            name = "medium"
+            target = 10
+
+            [[runs]]
+            name = "large"
+            target = 100
+            "#,
+        )
+        .unwrap();
+
+        let results = Scenario::new()
+            .step(Step::named("emit").run_readonly(|ctx| {
+                Box::pin(async move {
+                    let t = ctx.runtime().params().get_u64("target")?;
+                    ctx.runtime().metrics().counter("target", t);
+                    Ok(())
+                })
+            }))
+            .run_suite(suite)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].run_name.as_deref(), Some("small"));
+        assert_eq!(results[1].run_name.as_deref(), Some("medium"));
+        assert_eq!(results[2].run_name.as_deref(), Some("large"));
+        assert_eq!(
+            results[0].summary.metrics.counters.get("target").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            results[1].summary.metrics.counters.get("target").copied(),
+            Some(10)
+        );
+        assert_eq!(
+            results[2].summary.metrics.counters.get("target").copied(),
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_suite_continues_after_step_failure() {
+        let suite = crate::RunSuite::from_toml_str(
+            r#"
+            [[runs]]
+            name = "ok-1"
+            fail = false
+
+            [[runs]]
+            name = "bad"
+            fail = true
+
+            [[runs]]
+            name = "ok-2"
+            fail = false
+            "#,
+        )
+        .unwrap();
+
+        let results = Scenario::new()
+            .step(Step::named("maybe_fail").run(|ctx| {
+                Box::pin(async move {
+                    let fail = ctx.runtime().params().get_bool("fail")?;
+                    if fail {
+                        anyhow::bail!("planned failure");
+                    }
+                    Ok(())
+                })
+            }))
+            .run_suite(suite)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].summary.success);
+        assert!(!results[1].summary.success);
+        assert_eq!(results[1].summary.error_count, 1);
+        // Third run still ran despite the middle one failing.
+        assert!(results[2].summary.success);
+    }
+
+    #[tokio::test]
+    async fn run_suite_framework_error_stops_the_suite() {
+        let suite = crate::RunSuite::from_toml_str(
+            r#"
+            [[runs]]
+            name = "a"
+            x = 1
+
+            [[runs]]
+            name = "b"
+            x = 2
+            "#,
+        )
+        .unwrap();
+
+        // Hook failure is a framework error — must surface as Err.
+        let result = Scenario::new()
+            .hook(crate::Hook::before_step("boom", |_ctx, _info| {
+                Box::pin(async move { anyhow::bail!("harness bug") })
+            }))
+            .step(Step::named("s").run(|_ctx| Box::pin(async move { Ok(()) })))
+            .run_suite(suite)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("harness bug"));
     }
 }
